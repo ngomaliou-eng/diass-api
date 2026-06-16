@@ -1,0 +1,16 @@
+# ─────────────────────────────────────────────
+# FICHIER .env — Centrale PV de Diass
+# NE PAS PARTAGER CE FICHIER
+# ─────────────────────────────────────────────
+
+# Clé secrète JWT — générer avec :
+# py -c "import secrets; print(secrets.token_hex(32))"
+SECRET_KEY=diass-secret-cle-a-remplacer-par-une-cle-aleatoire-de-64-caracteres
+
+# API Solcast — irradiance réelle GHI par 30 minutes
+CLE_SOLCAST=rvJ-YbdPt9zJ_NoSXyJolUtlJ7AV9VUS
+
+# Configuration email Gmail
+EMAIL_EXPEDITEUR=aliou99ngom@gmail.com
+EMAIL_MOT_DE_PASSE=nzxv jgkn aduh ujqc
+EMAIL_DESTINATAIRE=aliou99ngom@gmail.com

@@ -1,4 +1,10 @@
-fastapi
-uvicorn
-pyjwt
-python-multipart
+fastapi==0.135.2
+uvicorn==0.42.0
+pydantic==2.12.5
+python-jose==3.3.0
+PyJWT==2.12.1
+python-multipart==0.0.22
+requests==2.34.2
+python-dotenv==1.2.2
+pymodbus==3.13.0
+starlette==1.0.0
