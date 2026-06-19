@@ -19,7 +19,9 @@ load_dotenv()
 SECRET_KEY            = os.getenv("SECRET_KEY", "diass-secret-cle")
 ALGORITHM             = "HS256"
 TOKEN_EXPIRE_MINUTES  = 480
-NB_ONDULEURS          = 32
+NB_PTR                = 8    # Nombre de postes de transformation
+NB_ONDULEURS_PAR_PTR  = 4    # Onduleurs par PTR
+NB_ONDULEURS          = NB_PTR * NB_ONDULEURS_PAR_PTR  # 32 onduleurs au total
 PUISSANCE_NOMINALE_MW = 23.0
 
 # Mode de fonctionnement
@@ -193,8 +195,8 @@ def get_courbe_open_meteo():
 def get_donnees_http():
     """
     Récupère les données réelles via l'interface HTTP
-    du RTAC SEL3530-4 ou du datalogger UC8112.
-    IP équipement : 192.168.123.100
+    du datalogger UC8112 ou du RTAC SEL3530-4.
+    IP équipement SCADA : 192.168.123.100
     À configurer après identification des endpoints HTTP.
     """
     try:
@@ -221,29 +223,50 @@ def calculer_puissance(irradiance):
 def simuler_onduleurs(puissance_totale):
     """
     Génère l'état des 32 onduleurs depuis la puissance totale réelle.
+    Nomenclature : INV-{NuméroPTR}-{NuméroOnduleur}
+    8 PTR × 4 onduleurs = 32 onduleurs
+    Exemple : INV-1-1 = PTR1, onduleur 1
+              INV-3-4 = PTR3, onduleur 4
     pwk = (puissance_totale × 1000) / 32 onduleurs
-    INV-05 : toujours hors_ligne (panne permanente)
-    INV-12 : toujours en alerte (panne stable)
-    Autres : ok avec variation ±8%
+    INV-2-1 : toujours hors_ligne (panne permanente pour test)
+    INV-3-4 : toujours en alerte (panne stable pour test)
+    Autres  : ok avec variation ±8%
     """
     onduleurs = []
     pwk = (puissance_totale * 1000) / NB_ONDULEURS
-    for i in range(1, NB_ONDULEURS + 1):
-        if i == 5:
-            o = {"id": f"INV-{i:02d}", "puissance_kw": 0.0,
-                 "statut": "hors_ligne", "temperature_c": 0.0}
-        elif i == 12:
-            # Statut stable — pas aléatoire pour éviter les doublons email
-            o = {"id": f"INV-{i:02d}",
-                 "puissance_kw": round(pwk * random.uniform(0.3, 0.6), 1),
-                 "statut": "alerte",
-                 "temperature_c": round(random.uniform(65, 75), 1)}
-        else:
-            o = {"id": f"INV-{i:02d}",
-                 "puissance_kw": round(pwk * random.uniform(0.92, 1.08), 1),
-                 "statut": "ok",
-                 "temperature_c": round(random.uniform(38, 52), 1)}
-        onduleurs.append(o)
+
+    for ptr in range(1, NB_PTR + 1):
+        for num in range(1, NB_ONDULEURS_PAR_PTR + 1):
+            inv_id = f"INV-{ptr}-{num}"
+
+            # INV-2-1 → hors_ligne (panne permanente)
+            if ptr == 2 and num == 1:
+                o = {
+                    "id":            inv_id,
+                    "ptr":           f"PTR{ptr}",
+                    "puissance_kw":  0.0,
+                    "statut":        "hors_ligne",
+                    "temperature_c": 0.0
+                }
+            # INV-3-4 → alerte (panne stable)
+            elif ptr == 3 and num == 4:
+                o = {
+                    "id":            inv_id,
+                    "ptr":           f"PTR{ptr}",
+                    "puissance_kw":  round(pwk * random.uniform(0.3, 0.6), 1),
+                    "statut":        "alerte",
+                    "temperature_c": round(random.uniform(65, 75), 1)
+                }
+            else:
+                o = {
+                    "id":            inv_id,
+                    "ptr":           f"PTR{ptr}",
+                    "puissance_kw":  round(pwk * random.uniform(0.92, 1.08), 1),
+                    "statut":        "ok",
+                    "temperature_c": round(random.uniform(38, 52), 1)
+                }
+            onduleurs.append(o)
+
     return onduleurs
 
 
@@ -350,15 +373,13 @@ def get_instantanees(u=Depends(verifier_token)):
     for o in onduleurs:
         cle = f"{o['id']}_{o['statut']}"
         if o["statut"] in ("hors_ligne", "alerte"):
-            # Envoyer seulement si pas d'alerte récente (< 5 minutes)
             if cle not in alertes_envoyees or \
                (now - alertes_envoyees[cle]).total_seconds() > DELAI_MIN_ALERTE:
                 envoyer_alerte_email(o["id"], o["statut"],
                                      o["puissance_kw"], o["temperature_c"])
                 alertes_envoyees[cle] = now
-                print(f"[ALERTE] {o['id']} - {o['statut']} enregistree")
+                print(f"[ALERTE] {o['id']} ({o['ptr']}) - {o['statut']} enregistree")
         elif o["statut"] == "ok":
-            # Supprimer seulement alerte — hors_ligne reste bloqué
             alertes_envoyees.pop(f"{o['id']}_alerte", None)
 
     return {
@@ -394,6 +415,41 @@ def get_courbe(u=Depends(verifier_token)):
             })
 
     return courbe
+
+
+@app.get("/donnees/par-ptr")
+def get_par_ptr(u=Depends(verifier_token)):
+    """
+    Retourne les données groupées par PTR.
+    Permet d'afficher la puissance totale de chaque PTR.
+    """
+    _, puissance, onduleurs = get_donnees()
+
+    ptrs = {}
+    for o in onduleurs:
+        ptr = o["ptr"]
+        if ptr not in ptrs:
+            ptrs[ptr] = {
+                "ptr":           ptr,
+                "puissance_kw":  0.0,
+                "nb_ok":         0,
+                "nb_alerte":     0,
+                "nb_hors_ligne": 0,
+                "onduleurs":     []
+            }
+        ptrs[ptr]["onduleurs"].append(o)
+        ptrs[ptr]["puissance_kw"] += o["puissance_kw"]
+        if o["statut"] == "ok":
+            ptrs[ptr]["nb_ok"] += 1
+        elif o["statut"] == "alerte":
+            ptrs[ptr]["nb_alerte"] += 1
+        else:
+            ptrs[ptr]["nb_hors_ligne"] += 1
+
+    for ptr in ptrs:
+        ptrs[ptr]["puissance_kw"] = round(ptrs[ptr]["puissance_kw"], 1)
+
+    return list(ptrs.values())
 
 
 @app.get("/sante")
