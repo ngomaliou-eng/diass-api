@@ -385,7 +385,7 @@ Veuillez verifier l etat de cet onduleur des que possible.
 Systeme de supervision automatique - Centrale PV de Diass - SENELEC
         """
         msg.attach(MIMEText(corps, "plain", "utf-8"))
-        serveur = smtplib.SMTP("smtp.gmail.com", 587)
+        serveur = smtplib.SMTP("smtp.gmail.com", 465)
         serveur.starttls()
         serveur.login(EMAIL_EXPEDITEUR, EMAIL_MOT_DE_PASSE)
         serveur.sendmail(EMAIL_EXPEDITEUR, EMAIL_DESTINATAIRE, msg.as_string())
