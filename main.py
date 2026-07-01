@@ -32,8 +32,8 @@ MODE = "meteo"
 
 # Coordonnées GPS exactes de la centrale de Diass
 # Commune de Diass, Département de Mbour, Région de Thiès
-LAT_DIASS = 14.653090
-LON_DIASS = -17.103332
+LAT_DIASS = 14.653162
+LON_DIASS = -17.103018
 
 # IP du RTAC SEL-3530-4 (à confirmer sur le réseau industriel)
 IP_RTAC = os.getenv("IP_RTAC", "192.168.123.135")
