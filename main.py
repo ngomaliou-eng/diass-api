@@ -26,8 +26,8 @@ PUISSANCE_NOMINALE_MW = 23.040  # MWc réelle de la centrale
 ETA                   = 0.795   # Rendement moyen annuel — Source : J492
 
 # Mode de fonctionnement
-# "meteo" → irradiance réelle Open-Meteo (cache 5 min)
-# "modbus" → données réelles via Modbus TCP du RTAC
+# "meteo"  → irradiance réelle Open-Meteo (cache 5 min)
+# "modbus" → données réelles via RTAC SEL-3530-4
 MODE = "meteo"
 
 # Coordonnées GPS exactes de la centrale de Diass
@@ -41,26 +41,6 @@ IP_RTAC = os.getenv("IP_RTAC", "192.168.123.135")
 UTILISATEURS = {
     "admin":   {"mot_de_passe": "diass2024",  "role": "admin"},
     "manager": {"mot_de_passe": "senelec123", "role": "viewer"},
-}
-
-# ─────────────────────────────────────────────
-# PR THÉORIQUE MENSUEL DE LA CENTRALE (%)
-# Source : Documentation technique J492, centrale PV de Diass
-# Utilisé pour évaluer les performances réelles vs théoriques
-# ─────────────────────────────────────────────
-PR_THEORIQUE_MENSUEL = {
-    1:  81.0,   # Janvier
-    2:  80.1,   # Février
-    3:  79.0,   # Mars
-    4:  79.1,   # Avril
-    5:  79.8,   # Mai
-    6:  79.5,   # Juin
-    7:  79.6,   # Juillet
-    8:  79.8,   # Août
-    9:  79.2,   # Septembre
-    10: 78.2,   # Octobre
-    11: 78.6,   # Novembre
-    12: 79.5,   # Décembre
 }
 
 # ─────────────────────────────────────────────
@@ -131,6 +111,7 @@ def get_irradiance_reelle():
     Récupère l'irradiance solaire réelle (GHI) via Open-Meteo.
     Coordonnées GPS : 14.653090°N, 17.103332°O
     Commune de Diass, Département de Mbour, Région de Thiès.
+    Cache de 5 minutes pour limiter les appels API.
     """
     global cache_irradiance
     now = datetime.now()
@@ -149,8 +130,8 @@ def get_irradiance_reelle():
             "&current=shortwave_radiation"
             "&timezone=Africa/Dakar"
         )
-        res  = requests.get(url, timeout=10)
-        data = res.json()
+        res       = requests.get(url, timeout=10)
+        data      = res.json()
         irradiance = data["current"]["shortwave_radiation"]
 
         cache_irradiance["valeur"] = round(float(irradiance), 1)
@@ -165,59 +146,6 @@ def get_irradiance_reelle():
         return None
 
 
-def get_courbe_open_meteo():
-    """
-    Récupère les données par 15 minutes depuis Open-Meteo.
-    Un point toutes les 15 minutes pour une courbe réelle et précise.
-    """
-    try:
-        url = (
-            "https://api.open-meteo.com/v1/forecast"
-            f"?latitude={LAT_DIASS}&longitude={LON_DIASS}"
-            "&minutely_15=shortwave_radiation"
-            "&timezone=Africa/Dakar"
-            "&forecast_days=1"
-        )
-        res  = requests.get(url, timeout=10)
-        data = res.json()
-
-        heures  = data["minutely_15"]["time"]
-        valeurs = data["minutely_15"]["shortwave_radiation"]
-
-        now             = datetime.now()
-        heure_actuelle  = now.hour
-        minute_actuelle = now.minute
-        courbe = []
-
-        for i, h in enumerate(heures):
-            heure_h  = int(h[11:13])
-            minute_h = int(h[14:16])
-
-            if heure_h < 6:   continue
-            if heure_h > heure_actuelle: break
-            if heure_h == heure_actuelle and minute_h > minute_actuelle: break
-            if heure_h > 19:  break
-
-            irradiance = max(0.0, round(float(valeurs[i]), 1))
-            # Puissance = somme des puissances des 32 onduleurs
-            onduleurs_courbe = simuler_onduleurs(irradiance)
-            puissance_mw = round(
-                sum(o["puissance_kw"] for o in onduleurs_courbe) / 1000, 3
-            )
-            courbe.append({
-                "heure":          f"{heure_h:02d}h{minute_h:02d}",
-                "puissance_mw":   puissance_mw,
-                "irradiance_wm2": irradiance
-            })
-
-        print(f"[COURBE] {len(courbe)} points (1/15min) depuis Open-Meteo")
-        return courbe
-
-    except Exception as e:
-        print(f"[COURBE] Erreur Open-Meteo : {e} → fallback sinusoidal")
-        return None
-
-
 # ─────────────────────────────────────────────
 # MODE MODBUS — Données réelles via RTAC SEL-3530-4
 # ─────────────────────────────────────────────
@@ -229,59 +157,54 @@ def get_donnees_modbus():
     """
     try:
         print(f"[MODBUS] Connexion RTAC : {IP_RTAC}:502 — non encore configuré")
-        return None, None, None
+        return None, None
     except Exception as e:
         print(f"[MODBUS] Erreur : {e}")
-        return None, None, None
+        return None, None
 
 
 # ─────────────────────────────────────────────
-# CALCUL DE LA PUISSANCE
+# CALCUL DE LA PUISSANCE D'UN ONDULEUR
+# Formule : P = (G / Gref) × Pnom × η
+# G    = irradiance mesurée (W/m²)
+# Gref = 1000 W/m² (conditions standard STC)
+# Pnom = puissance nominale réelle de l'onduleur (kWc) — Source J492
+# η    = 79.5% (rendement moyen annuel) — Source J492
 # ─────────────────────────────────────────────
 def calculer_puissance_onduleur(inv_id, irradiance):
-    """
-    Calcule la puissance produite par un onduleur.
-    Formule : P = (G / Gref) x Pnom x eta
-    Source puissances nominales : Documentation J492
-    eta = 79.5% (rendement moyen annuel) — Source J492
-    """
     pnom = PUISSANCES_NOMINALES.get(inv_id, 699.84)
     return round((irradiance / 1000) * pnom * ETA, 1)
 
 
+# ─────────────────────────────────────────────
+# CALCUL DU RATIO DE PERFORMANCE (PR)
+# PR = (P_mesurée / P_nominale) / (G / Gref) × 100
+# Norme IEC 61724-1:2021
+# ─────────────────────────────────────────────
 def calculer_pr(puissance_kw, pnom_kw, irradiance):
-    """
-    Calcule le Ratio de Performance (PR) d'un onduleur.
-    PR = (P_mesurée / P_nominale) / (G / Gref) × 100
-    Norme IEC 61724-1:2021
-    """
     if irradiance <= 0 or pnom_kw <= 0:
         return 0.0
     return round((puissance_kw / pnom_kw) / (irradiance / 1000) * 100, 1)
 
 
 # ─────────────────────────────────────────────
-# SIMULATION DES ONDULEURS
+# CALCUL DE L'ÉNERGIE D'UN ONDULEUR
+# E = P × t (puissance × heures de production depuis 6h)
 # ─────────────────────────────────────────────
 def calculer_energie(puissance_kw, heure_actuelle):
-    """
-    Calcule l'énergie journalière produite par un onduleur en kWh.
-    E = P × t (puissance × nombre d'heures depuis 6h)
-    """
     heures_production = max(0, heure_actuelle - 6)
-    return round(puissance_kw * heures_production / 1000, 3)  # kWh → MWh
+    return round(puissance_kw * heures_production / 1000, 3)  # kW → MWh
 
 
+# ─────────────────────────────────────────────
+# SIMULATION DES ONDULEURS
+# Pour chaque onduleur : calcul de P, E et PR individuels
+# Nomenclature : INV-{NuméroPTR}-{NuméroOnduleur}
+# 8 PTR × 4 onduleurs = 32 onduleurs
+# INV-2-1 : hors_ligne (test) / INV-3-4 : alerte (test)
+# ─────────────────────────────────────────────
 def simuler_onduleurs(irradiance):
-    """
-    Génère l'état des 32 onduleurs depuis l'irradiance réelle.
-    Nomenclature : INV-{NuméroPTR}-{NuméroOnduleur}
-    8 PTR × 4 onduleurs = 32 onduleurs
-    Puissances nominales réelles issues de la documentation J492.
-    INV-2-1 : hors_ligne (panne permanente pour test)
-    INV-3-4 : alerte    (fonctionnement dégradé pour test)
-    """
-    onduleurs = []
+    onduleurs      = []
     heure_actuelle = datetime.now().hour
 
     for ptr in range(1, NB_PTR + 1):
@@ -290,7 +213,7 @@ def simuler_onduleurs(irradiance):
             pnom   = PUISSANCES_NOMINALES.get(inv_id, 699.84)
 
             if ptr == 2 and num == 1:
-                # Onduleur hors ligne — panne permanente (test)
+                # Onduleur hors ligne — test
                 o = {
                     "id":           inv_id,
                     "ptr":          f"PTR{ptr}",
@@ -302,8 +225,7 @@ def simuler_onduleurs(irradiance):
                 }
             elif ptr == 3 and num == 4:
                 # Onduleur en alerte — fonctionnement dégradé (test)
-                pkw = round(pnom * (irradiance / 1000)
-                            * random.uniform(0.35, 0.55), 1)
+                pkw = round(pnom * (irradiance / 1000) * random.uniform(0.35, 0.55), 1)
                 o = {
                     "id":           inv_id,
                     "ptr":          f"PTR{ptr}",
@@ -331,21 +253,20 @@ def simuler_onduleurs(irradiance):
 
 
 # ─────────────────────────────────────────────
-# FONCTION PRINCIPALE
+# FONCTION PRINCIPALE — Récupération des données
 # ─────────────────────────────────────────────
 def get_donnees():
     """
-    Récupère les données selon le MODE configuré.
-    - meteo  : irradiance réelle Open-Meteo (cache 5 min)
-    - modbus : données réelles via RTAC SEL-3530-4
-    Fallback automatique si Open-Meteo est indisponible.
+    Récupère l'irradiance selon le MODE configuré.
+    Retourne : (irradiance, onduleurs)
+    Les indicateurs globaux sont calculés dans les routes.
     """
     heure = datetime.now().hour
 
     if MODE == "modbus":
-        irradiance, puissance, onduleurs = get_donnees_modbus()
+        irradiance, onduleurs = get_donnees_modbus()
         if irradiance is not None:
-            return irradiance, puissance, onduleurs
+            return irradiance, onduleurs
         print("[MODBUS] Fallback vers mode meteo")
 
     irradiance = get_irradiance_reelle()
@@ -355,15 +276,11 @@ def get_donnees():
             irradiance = 0.0
             print("[INFO] Nuit — irradiance nulle")
         else:
-            irradiance = round(
-                950 * math.sin(math.pi * (heure - 6) / 13), 1
-            )
+            irradiance = round(950 * math.sin(math.pi * (heure - 6) / 13), 1)
             print(f"[FALLBACK] Irradiance estimee : {irradiance} W/m2")
 
     onduleurs = simuler_onduleurs(irradiance)
-    # Puissance totale = somme des puissances des 32 onduleurs (kW → MW)
-    puissance = round(sum(o["puissance_kw"] for o in onduleurs) / 1000, 3)
-    return irradiance, puissance, onduleurs
+    return irradiance, onduleurs
 
 
 # ─────────────────────────────────────────────
@@ -393,8 +310,6 @@ Veuillez verifier l etat de cet onduleur des que possible.
 Systeme de supervision automatique - Centrale PV de Diass - SENELEC
         """
         msg.attach(MIMEText(corps, "plain", "utf-8"))
-
-        # Port 465 SSL direct — plus fiable sur Render que le port 587 STARTTLS
         serveur = smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=15)
         serveur.login(EMAIL_EXPEDITEUR, EMAIL_MOT_DE_PASSE)
         serveur.sendmail(EMAIL_EXPEDITEUR, EMAIL_DESTINATAIRE, msg.as_string())
@@ -421,7 +336,7 @@ def connexion(form: OAuth2PasswordRequestForm = Depends()):
 
 @app.get("/donnees/instantanees")
 def get_instantanees(u=Depends(verifier_token)):
-    irradiance, puissance, onduleurs = get_donnees()
+    irradiance, onduleurs = get_donnees()
 
     # Puissance totale = somme des puissances des 32 onduleurs (kW → MW)
     puissance_totale = round(
@@ -433,7 +348,7 @@ def get_instantanees(u=Depends(verifier_token)):
         sum(o["energie_mwh"] for o in onduleurs), 3
     )
 
-    # PR global = moyenne des PR des onduleurs actifs (statut ok)
+    # PR global = moyenne des PR des onduleurs actifs uniquement
     onduleurs_actifs = [o for o in onduleurs if o["statut"] == "ok"]
     pr_global = round(
         sum(o["pr"] for o in onduleurs_actifs) / len(onduleurs_actifs), 1
@@ -467,16 +382,59 @@ def get_instantanees(u=Depends(verifier_token)):
 def get_courbe(u=Depends(verifier_token)):
     """
     Retourne l'historique de la journée (1 point / 15 min).
+    La puissance de chaque point = somme des puissances des 32 onduleurs.
     """
-    courbe = get_courbe_open_meteo()
+    try:
+        url = (
+            "https://api.open-meteo.com/v1/forecast"
+            f"?latitude={LAT_DIASS}&longitude={LON_DIASS}"
+            "&minutely_15=shortwave_radiation"
+            "&timezone=Africa/Dakar"
+            "&forecast_days=1"
+        )
+        res  = requests.get(url, timeout=10)
+        data = res.json()
 
-    if courbe is None:
+        heures          = data["minutely_15"]["time"]
+        valeurs         = data["minutely_15"]["shortwave_radiation"]
+        now             = datetime.now()
+        heure_actuelle  = now.hour
+        minute_actuelle = now.minute
+        courbe          = []
+
+        for i, h in enumerate(heures):
+            heure_h  = int(h[11:13])
+            minute_h = int(h[14:16])
+
+            if heure_h < 6:                                              continue
+            if heure_h > heure_actuelle:                                 break
+            if heure_h == heure_actuelle and minute_h > minute_actuelle: break
+            if heure_h > 19:                                             break
+
+            irradiance       = max(0.0, round(float(valeurs[i]), 1))
+            onduleurs_courbe = simuler_onduleurs(irradiance)
+
+            # Puissance = somme des puissances des 32 onduleurs
+            puissance_mw = round(
+                sum(o["puissance_kw"] for o in onduleurs_courbe) / 1000, 3
+            )
+            courbe.append({
+                "heure":          f"{heure_h:02d}h{minute_h:02d}",
+                "puissance_mw":   puissance_mw,
+                "irradiance_wm2": irradiance
+            })
+
+        print(f"[COURBE] {len(courbe)} points depuis Open-Meteo")
+        return courbe
+
+    except Exception as e:
+        print(f"[COURBE] Erreur Open-Meteo : {e} — fallback sinusoidal")
         heure_actuelle = datetime.now().hour
         courbe = []
         for h in range(6, min(heure_actuelle + 1, 20)):
-            irradiance = round(950 * math.sin(math.pi * (h - 6) / 13), 1)
+            irradiance       = round(950 * math.sin(math.pi * (h - 6) / 13), 1)
             onduleurs_courbe = simuler_onduleurs(irradiance)
-            puissance_mw = round(
+            puissance_mw     = round(
                 sum(o["puissance_kw"] for o in onduleurs_courbe) / 1000, 3
             )
             courbe.append({
@@ -484,8 +442,7 @@ def get_courbe(u=Depends(verifier_token)):
                 "puissance_mw":   puissance_mw,
                 "irradiance_wm2": irradiance
             })
-
-    return courbe
+        return courbe
 
 
 @app.get("/donnees/par-ptr")
@@ -494,38 +451,40 @@ def get_par_ptr(u=Depends(verifier_token)):
     Retourne les données agrégées par PTR.
     8 PTR × 4 onduleurs = 32 onduleurs.
     """
-    irradiance, _, onduleurs = get_donnees()
+    irradiance, onduleurs = get_donnees()
 
     ptrs = {}
     for o in onduleurs:
         ptr = o["ptr"]
         if ptr not in ptrs:
             ptrs[ptr] = {
-                "ptr":            ptr,
-                "puissance_kw":   0.0,
-                "pnom_kwc":       0.0,
-                "pr_moyen":       0.0,
-                "nb_ok":          0,
-                "nb_alerte":      0,
-                "nb_hors_ligne":  0,
-                "onduleurs":      []
+                "ptr":           ptr,
+                "puissance_kw":  0.0,
+                "energie_mwh":   0.0,
+                "pnom_kwc":      0.0,
+                "pr_moyen":      0.0,
+                "nb_ok":         0,
+                "nb_alerte":     0,
+                "nb_hors_ligne": 0,
+                "onduleurs":     []
             }
         ptrs[ptr]["onduleurs"].append(o)
         ptrs[ptr]["puissance_kw"] += o["puissance_kw"]
+        ptrs[ptr]["energie_mwh"]  += o["energie_mwh"]
         ptrs[ptr]["pnom_kwc"]     += o["pnom_kwc"]
-        if o["statut"] == "ok":          ptrs[ptr]["nb_ok"]         += 1
-        elif o["statut"] == "alerte":    ptrs[ptr]["nb_alerte"]     += 1
-        else:                            ptrs[ptr]["nb_hors_ligne"]  += 1
+        if o["statut"] == "ok":       ptrs[ptr]["nb_ok"]         += 1
+        elif o["statut"] == "alerte": ptrs[ptr]["nb_alerte"]     += 1
+        else:                         ptrs[ptr]["nb_hors_ligne"]  += 1
 
-    # Arrondir et calculer PR moyen par PTR
+    # PR moyen par PTR = moyenne des PR des onduleurs actifs du PTR
     for ptr in ptrs:
         ptrs[ptr]["puissance_kw"] = round(ptrs[ptr]["puissance_kw"], 1)
+        ptrs[ptr]["energie_mwh"]  = round(ptrs[ptr]["energie_mwh"], 3)
         ptrs[ptr]["pnom_kwc"]     = round(ptrs[ptr]["pnom_kwc"], 2)
-        ptrs[ptr]["pr_moyen"]     = calculer_pr(
-            ptrs[ptr]["puissance_kw"],
-            ptrs[ptr]["pnom_kwc"],
-            irradiance
-        )
+        actifs = [o for o in ptrs[ptr]["onduleurs"] if o["statut"] == "ok"]
+        ptrs[ptr]["pr_moyen"] = round(
+            sum(o["pr"] for o in actifs) / len(actifs), 1
+        ) if actifs else 0.0
 
     return list(ptrs.values())
 
@@ -533,9 +492,10 @@ def get_par_ptr(u=Depends(verifier_token)):
 @app.get("/sante")
 def sante():
     return {
-        "statut":  "ok",
-        "mode":    MODE,
-        "heure":   datetime.now().strftime("%H:%M:%S"),
-        "centrale": "PV Diass — SENELEC",
-        "puissance_nominale_mwc": PUISSANCE_NOMINALE_MW
+        "statut":                 "ok",
+        "mode":                   MODE,
+        "heure":                  datetime.now().strftime("%H:%M:%S"),
+        "centrale":               "PV Diass — SENELEC",
+        "puissance_nominale_mwc": PUISSANCE_NOMINALE_MW,
+        "eta":                    ETA
     }
