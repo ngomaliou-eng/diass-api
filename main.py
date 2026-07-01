@@ -23,6 +23,7 @@ NB_PTR                = 8
 NB_ONDULEURS_PAR_PTR  = 4
 NB_ONDULEURS          = NB_PTR * NB_ONDULEURS_PAR_PTR  # 32 onduleurs
 PUISSANCE_NOMINALE_MW = 23.040  # MWc réelle de la centrale
+ETA                   = 0.795   # Rendement moyen annuel — Source : J492
 
 # Mode de fonctionnement
 # "meteo" → irradiance réelle Open-Meteo (cache 5 min)
@@ -198,9 +199,14 @@ def get_courbe_open_meteo():
             if heure_h > 19:  break
 
             irradiance = max(0.0, round(float(valeurs[i]), 1))
+            # Puissance = somme des puissances des 32 onduleurs
+            onduleurs_courbe = simuler_onduleurs(irradiance)
+            puissance_mw = round(
+                sum(o["puissance_kw"] for o in onduleurs_courbe) / 1000, 3
+            )
             courbe.append({
                 "heure":          f"{heure_h:02d}h{minute_h:02d}",
-                "puissance_mw":   calculer_puissance_totale(irradiance),
+                "puissance_mw":   puissance_mw,
                 "irradiance_wm2": irradiance
             })
 
@@ -232,27 +238,15 @@ def get_donnees_modbus():
 # ─────────────────────────────────────────────
 # CALCUL DE LA PUISSANCE
 # ─────────────────────────────────────────────
-def calculer_puissance_totale(irradiance):
-    """
-    Calcule la puissance totale produite en MW depuis l'irradiance réelle.
-    Formule : P = (G / Gref) × Pnom × η
-    G    = irradiance GHI mesurée (W/m²)
-    Gref = 1000 W/m² (conditions standard STC)
-    Pnom = 23.040 MWc (puissance nominale réelle de la centrale)
-    η    = rendement global 78% à 82%
-    """
-    return round((irradiance / 1000) * PUISSANCE_NOMINALE_MW
-                 * random.uniform(0.78, 0.82), 3)
-
-
 def calculer_puissance_onduleur(inv_id, irradiance):
     """
-    Calcule la puissance produite par un onduleur spécifique.
-    Utilise la puissance nominale réelle de chaque onduleur.
-    Source : Documentation technique J492, centrale PV de Diass.
+    Calcule la puissance produite par un onduleur.
+    Formule : P = (G / Gref) x Pnom x eta
+    Source puissances nominales : Documentation J492
+    eta = 79.5% (rendement moyen annuel) — Source J492
     """
     pnom = PUISSANCES_NOMINALES.get(inv_id, 699.84)
-    return round((irradiance / 1000) * pnom * random.uniform(0.78, 0.82), 1)
+    return round((irradiance / 1000) * pnom * ETA, 1)
 
 
 def calculer_pr(puissance_kw, pnom_kw, irradiance):
@@ -269,6 +263,15 @@ def calculer_pr(puissance_kw, pnom_kw, irradiance):
 # ─────────────────────────────────────────────
 # SIMULATION DES ONDULEURS
 # ─────────────────────────────────────────────
+def calculer_energie(puissance_kw, heure_actuelle):
+    """
+    Calcule l'énergie journalière produite par un onduleur en kWh.
+    E = P × t (puissance × nombre d'heures depuis 6h)
+    """
+    heures_production = max(0, heure_actuelle - 6)
+    return round(puissance_kw * heures_production / 1000, 3)  # kWh → MWh
+
+
 def simuler_onduleurs(irradiance):
     """
     Génère l'état des 32 onduleurs depuis l'irradiance réelle.
@@ -279,6 +282,7 @@ def simuler_onduleurs(irradiance):
     INV-3-4 : alerte    (fonctionnement dégradé pour test)
     """
     onduleurs = []
+    heure_actuelle = datetime.now().hour
 
     for ptr in range(1, NB_PTR + 1):
         for num in range(1, NB_ONDULEURS_PAR_PTR + 1):
@@ -292,6 +296,7 @@ def simuler_onduleurs(irradiance):
                     "ptr":          f"PTR{ptr}",
                     "pnom_kwc":     pnom,
                     "puissance_kw": 0.0,
+                    "energie_mwh":  0.0,
                     "pr":           0.0,
                     "statut":       "hors_ligne"
                 }
@@ -304,6 +309,7 @@ def simuler_onduleurs(irradiance):
                     "ptr":          f"PTR{ptr}",
                     "pnom_kwc":     pnom,
                     "puissance_kw": pkw,
+                    "energie_mwh":  calculer_energie(pkw, heure_actuelle),
                     "pr":           calculer_pr(pkw, pnom, irradiance),
                     "statut":       "alerte"
                 }
@@ -315,6 +321,7 @@ def simuler_onduleurs(irradiance):
                     "ptr":          f"PTR{ptr}",
                     "pnom_kwc":     pnom,
                     "puissance_kw": pkw,
+                    "energie_mwh":  calculer_energie(pkw, heure_actuelle),
                     "pr":           calculer_pr(pkw, pnom, irradiance),
                     "statut":       "ok"
                 }
@@ -353,13 +360,14 @@ def get_donnees():
             )
             print(f"[FALLBACK] Irradiance estimee : {irradiance} W/m2")
 
-    puissance = calculer_puissance_totale(irradiance)
     onduleurs = simuler_onduleurs(irradiance)
+    # Puissance totale = somme des puissances des 32 onduleurs (kW → MW)
+    puissance = round(sum(o["puissance_kw"] for o in onduleurs) / 1000, 3)
     return irradiance, puissance, onduleurs
 
 
 # ─────────────────────────────────────────────
-# FONCTION EMAIL
+# FONCTION EMAIL — SMTP via SSL (port 465)
 # ─────────────────────────────────────────────
 def envoyer_alerte_email(onduleur_id, statut, puissance, pr):
     if not EMAIL_ACTIF:
@@ -385,8 +393,9 @@ Veuillez verifier l etat de cet onduleur des que possible.
 Systeme de supervision automatique - Centrale PV de Diass - SENELEC
         """
         msg.attach(MIMEText(corps, "plain", "utf-8"))
-        serveur = smtplib.SMTP("smtp.gmail.com", 465)
-        serveur.starttls()
+
+        # Port 465 SSL direct — plus fiable sur Render que le port 587 STARTTLS
+        serveur = smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=15)
         serveur.login(EMAIL_EXPEDITEUR, EMAIL_MOT_DE_PASSE)
         serveur.sendmail(EMAIL_EXPEDITEUR, EMAIL_DESTINATAIRE, msg.as_string())
         serveur.quit()
@@ -412,15 +421,23 @@ def connexion(form: OAuth2PasswordRequestForm = Depends()):
 
 @app.get("/donnees/instantanees")
 def get_instantanees(u=Depends(verifier_token)):
-    heure = datetime.now().hour
     irradiance, puissance, onduleurs = get_donnees()
 
-    # Calcul du PR global de la centrale
-    if irradiance > 0:
-        pr_global = round((puissance / PUISSANCE_NOMINALE_MW)
-                          / (irradiance / 1000) * 100, 1)
-    else:
-        pr_global = 0.0
+    # Puissance totale = somme des puissances des 32 onduleurs (kW → MW)
+    puissance_totale = round(
+        sum(o["puissance_kw"] for o in onduleurs) / 1000, 3
+    )
+
+    # Énergie totale = somme des énergies des 32 onduleurs (MWh)
+    energie_totale = round(
+        sum(o["energie_mwh"] for o in onduleurs), 3
+    )
+
+    # PR global = moyenne des PR des onduleurs actifs (statut ok)
+    onduleurs_actifs = [o for o in onduleurs if o["statut"] == "ok"]
+    pr_global = round(
+        sum(o["pr"] for o in onduleurs_actifs) / len(onduleurs_actifs), 1
+    ) if onduleurs_actifs else 0.0
 
     # Gestion alertes email — anti-doublon 5 minutes
     now = datetime.now()
@@ -435,20 +452,13 @@ def get_instantanees(u=Depends(verifier_token)):
         elif o["statut"] == "ok":
             alertes_envoyees.pop(f"{o['id']}_alerte", None)
 
-    # PR théorique du mois en cours
-    mois_actuel  = datetime.now().month
-    pr_theorique = PR_THEORIQUE_MENSUEL.get(mois_actuel, 79.5)
-    ecart_pr     = round(pr_global - pr_theorique, 1)
-
     return {
         "timestamp":         datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "mode":              MODE,
-        "puissance_mw":      puissance,
+        "puissance_mw":      puissance_totale,
         "irradiance_wm2":    irradiance,
-        "energie_jour_mwh":  round(puissance * max(0, heure - 6) * 0.85, 1),
+        "energie_jour_mwh":  energie_totale,
         "ratio_performance": pr_global,
-        "pr_theorique":      pr_theorique,
-        "ecart_pr":          ecart_pr,
         "onduleurs":         onduleurs
     }
 
@@ -465,9 +475,13 @@ def get_courbe(u=Depends(verifier_token)):
         courbe = []
         for h in range(6, min(heure_actuelle + 1, 20)):
             irradiance = round(950 * math.sin(math.pi * (h - 6) / 13), 1)
+            onduleurs_courbe = simuler_onduleurs(irradiance)
+            puissance_mw = round(
+                sum(o["puissance_kw"] for o in onduleurs_courbe) / 1000, 3
+            )
             courbe.append({
                 "heure":          f"{h:02d}h00",
-                "puissance_mw":   calculer_puissance_totale(irradiance),
+                "puissance_mw":   puissance_mw,
                 "irradiance_wm2": irradiance
             })
 
