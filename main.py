@@ -173,9 +173,9 @@ def get_donnees_modbus():
 # ─────────────────────────────────────────────
 def calculer_puissance_onduleur(inv_id, irradiance):
     pnom = PUISSANCES_NOMINALES.get(inv_id, 699.84)
-    return round((irradiance / 1000) * pnom * ETA, 1)
-
-
+    # Rendement aléatoire entre PR min et PR max — Source J492
+    eta_onduleur = random.uniform(0.782, 0.810)
+    return round((irradiance / 1000) * pnom * eta_onduleur, 1)
 # ─────────────────────────────────────────────
 # CALCUL DU RATIO DE PERFORMANCE (PR)
 # PR = (P_mesurée / P_nominale) / (G / Gref) × 100
