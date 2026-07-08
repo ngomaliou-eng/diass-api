@@ -479,9 +479,8 @@ def get_instantanees(u=Depends(verifier_token)):
         elif o["statut"] == "ok":
             alertes_envoyees.pop(f"{o['id']}_alerte", None)
 
-    # Sauvegarde dans SQLite — une fois par heure
-    if datetime.now().minute < 10:
-        sauvegarder_donnees(puissance_totale, energie_totale, pr_global, irradiance)
+    # Sauvegarde dans SQLite à chaque appel
+    sauvegarder_donnees(puissance_totale, energie_totale, pr_global, irradiance)
 
     return {
         "timestamp":         datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -663,7 +662,9 @@ def get_historique(jours: int = 7, u=Depends(verifier_token)):
         historique = []
         for i, date in enumerate(dates):
             irr_jour    = float(irradiances[i]) if irradiances[i] else 0.0
-            irr_moy     = round(irr_jour * 1000 / 13, 1)
+            # irr_jour en MJ/m²/jour → irr_moy en W/m²
+            # 1 MJ/m² = 277.78 Wh/m², 13h de production
+            irr_moy     = round((irr_jour * 277.78) / 13, 1)
             energie_mwh = round((irr_moy / 1000) * PUISSANCE_NOMINALE_MW * ETA * 13, 2)
             pr_jour     = round(random.uniform(0.782, 0.810) * 100, 1)
             historique.append({
