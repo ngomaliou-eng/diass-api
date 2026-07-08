@@ -3,7 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
-import random, math, jwt, requests, os
+import random, math, jwt, requests, os, sqlite3
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -12,6 +12,33 @@ from email.mime.multipart import MIMEMultipart
 # CHARGEMENT DES VARIABLES D'ENVIRONNEMENT
 # ─────────────────────────────────────────────
 load_dotenv()
+
+# ─────────────────────────────────────────────
+# BASE DE DONNÉES SQLite — Historique
+# ─────────────────────────────────────────────
+DB_PATH = "diass_historique.db"
+
+def init_db():
+    """Crée la table historique si elle n'existe pas."""
+    conn = sqlite3.connect(DB_PATH)
+    cur  = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS historique (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            date         TEXT NOT NULL,
+            heure        TEXT NOT NULL,
+            puissance_mw REAL,
+            energie_mwh  REAL,
+            pr_global    REAL,
+            irradiance   REAL,
+            UNIQUE(date, heure)
+        )
+    """)
+    conn.commit()
+    conn.close()
+    print("[DB] Base de données initialisée")
+
+init_db()
 
 # ─────────────────────────────────────────────
 # CONFIGURATION GÉNÉRALE
@@ -32,8 +59,8 @@ MODE = "meteo"
 
 # Coordonnées GPS exactes de la centrale de Diass
 # Commune de Diass, Département de Mbour, Région de Thiès
-LAT_DIASS = 14.653162
-LON_DIASS = -17.103018
+LAT_DIASS = 14.653090
+LON_DIASS = -17.103332
 
 # IP du RTAC SEL-3530-4 (à confirmer sur le réseau industriel)
 IP_RTAC = os.getenv("IP_RTAC", "192.168.123.135")
@@ -63,7 +90,7 @@ PUISSANCES_NOMINALES = {
 # CONFIGURATION EMAIL
 # ─────────────────────────────────────────────
 EMAIL_EXPEDITEUR   = os.getenv("EMAIL_EXPEDITEUR",   "aliou99ngom@gmail.com")
-EMAIL_MOT_DE_PASSE = os.getenv("EMAIL_MOT_DE_PASSE", "uaba bqlf lyoh rpic")
+EMAIL_MOT_DE_PASSE = os.getenv("EMAIL_MOT_DE_PASSE", "nzxv jgkn aduh ujqc")
 EMAIL_DESTINATAIRE = os.getenv("EMAIL_DESTINATAIRE", "aliou99ngom@gmail.com")
 EMAIL_ACTIF        = True
 
@@ -151,15 +178,73 @@ def get_irradiance_reelle():
 # ─────────────────────────────────────────────
 def get_donnees_modbus():
     """
-    Récupère les données réelles via Modbus TCP du RTAC SEL-3530-4.
-    IP RTAC : à confirmer sur le réseau industriel de la centrale.
-    À configurer après identification des registres Modbus.
+    Récupère les données réelles via la Logic Engine API du RTAC SEL-3530-4.
+    
+    Procédure en trois étapes :
+    1. Authentification via HTTP POST sur l'interface web du RTAC
+    2. Interrogation des endpoints de la Logic Engine API
+    3. Parsing de la réponse JSON et transmission au frontend
+    
+    IP RTAC     : 192.168.123.135 (à confirmer sur le réseau industriel)
+    Protocole   : HTTPS (port 443)
+    Format      : JSON
+    
+    Note : Non configuré — identifiants d'accès non disponibles
+    durant la phase de développement.
     """
     try:
-        print(f"[MODBUS] Connexion RTAC : {IP_RTAC}:502 — non encore configuré")
+        # ── Étape 1 : Authentification ──────────────────────────────────
+        session = requests.Session()
+        login_url = f"https://{IP_RTAC}/login"
+
+        print(f"[RTAC] Tentative de connexion : {login_url}")
+        res_login = session.post(
+            login_url,
+            data={
+                "username": os.getenv("USER_RTAC", "admin"),
+                "password": os.getenv("PASS_RTAC", "")
+            },
+            timeout=10,
+            verify=False  # Certificat SSL auto-signé du RTAC
+        )
+
+        if res_login.status_code != 200:
+            print(f"[RTAC] Échec authentification : {res_login.status_code}")
+            return None, None
+
+        print(f"[RTAC] Authentification réussie")
+
+        # ── Étape 2 : Récupération des données via Logic Engine API ─────
+        # Format URL : https://[IP_RTAC]/api/[Nom_GVL]/[Nom_Variable]
+        endpoints = {
+            "irradiance":    f"https://{IP_RTAC}/api/GVL_Meteo/Irradiance",
+            "puissance":     f"https://{IP_RTAC}/api/GVL_Production/Puissance_Totale",
+            "energie":       f"https://{IP_RTAC}/api/GVL_Production/Energie_Jour",
+            "onduleurs":     f"https://{IP_RTAC}/api/GVL_Onduleurs/Etat",
+        }
+
+        donnees_rtac = {}
+        for cle, url in endpoints.items():
+            res = session.get(url, timeout=10, verify=False)
+            if res.status_code == 200:
+                donnees_rtac[cle] = res.json()
+                print(f"[RTAC] {cle} récupéré : {donnees_rtac[cle]}")
+            else:
+                print(f"[RTAC] Erreur {cle} : {res.status_code}")
+                return None, None
+
+        # ── Étape 3 : Parsing et construction des onduleurs ─────────────
+        irradiance = float(donnees_rtac["irradiance"].get("valeur", 0))
+        onduleurs  = simuler_onduleurs(irradiance)  # À remplacer par données réelles
+
+        print(f"[RTAC] Données récupérées — Irradiance : {irradiance} W/m2")
+        return irradiance, onduleurs
+
+    except requests.exceptions.ConnectionError:
+        print(f"[RTAC] Connexion impossible — réseau industriel inaccessible")
         return None, None
     except Exception as e:
-        print(f"[MODBUS] Erreur : {e}")
+        print(f"[RTAC] Erreur : {e}")
         return None, None
 
 
@@ -173,9 +258,9 @@ def get_donnees_modbus():
 # ─────────────────────────────────────────────
 def calculer_puissance_onduleur(inv_id, irradiance):
     pnom = PUISSANCES_NOMINALES.get(inv_id, 699.84)
-    # Rendement aléatoire entre PR min et PR max 
-    eta_onduleur = random.uniform(0.782, 0.810)
-    return round((irradiance / 1000) * pnom * eta_onduleur, 1)
+    return round((irradiance / 1000) * pnom * ETA, 1)
+
+
 # ─────────────────────────────────────────────
 # CALCUL DU RATIO DE PERFORMANCE (PR)
 # PR = (P_mesurée / P_nominale) / (G / Gref) × 100
@@ -284,6 +369,33 @@ def get_donnees():
 
 
 # ─────────────────────────────────────────────
+# FONCTION SAUVEGARDE SQLite
+# ─────────────────────────────────────────────
+def sauvegarder_donnees(puissance, energie, pr, irradiance):
+    """
+    Sauvegarde les données dans SQLite toutes les heures.
+    Utilisé pour construire l'historique réel de la centrale.
+    """
+    try:
+        now   = datetime.now()
+        date  = now.strftime("%Y-%m-%d")
+        heure = now.strftime("%H:00")
+
+        conn = sqlite3.connect(DB_PATH)
+        cur  = conn.cursor()
+        cur.execute("""
+            INSERT OR REPLACE INTO historique
+            (date, heure, puissance_mw, energie_mwh, pr_global, irradiance)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (date, heure, puissance, energie, pr, irradiance))
+        conn.commit()
+        conn.close()
+        print(f"[DB] Données sauvegardées : {date} {heure}")
+    except Exception as e:
+        print(f"[DB] Erreur sauvegarde : {e}")
+
+
+# ─────────────────────────────────────────────
 # FONCTION EMAIL — SMTP via SSL (port 465)
 # ─────────────────────────────────────────────
 def envoyer_alerte_email(onduleur_id, statut, puissance, pr):
@@ -366,6 +478,10 @@ def get_instantanees(u=Depends(verifier_token)):
                 alertes_envoyees[cle] = now
         elif o["statut"] == "ok":
             alertes_envoyees.pop(f"{o['id']}_alerte", None)
+
+    # Sauvegarde dans SQLite — une fois par heure
+    if datetime.now().minute < 10:
+        sauvegarder_donnees(puissance_totale, energie_totale, pr_global, irradiance)
 
     return {
         "timestamp":         datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -487,6 +603,82 @@ def get_par_ptr(u=Depends(verifier_token)):
         ) if actifs else 0.0
 
     return list(ptrs.values())
+
+
+@app.get("/donnees/historique")
+def get_historique(jours: int = 7, u=Depends(verifier_token)):
+    """
+    Retourne l'historique depuis SQLite.
+    Fallback vers Open-Meteo si pas de données en base.
+    """
+    jours = min(max(jours, 1), 30)
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cur  = conn.cursor()
+        cur.execute("""
+            SELECT
+                date,
+                MAX(energie_mwh)  as energie_mwh,
+                AVG(pr_global)    as pr_global,
+                AVG(irradiance)   as irradiance
+            FROM historique
+            WHERE date >= date('now', ?)
+            GROUP BY date
+            ORDER BY date ASC
+        """, (f"-{jours} days",))
+        rows = cur.fetchall()
+        conn.close()
+
+        if rows:
+            historique = []
+            for row in rows:
+                historique.append({
+                    "date":        row[0],
+                    "energie_mwh": round(row[1] or 0, 2),
+                    "pr_global":   round(row[2] or 0, 1),
+                    "irradiance":  round(row[3] or 0, 1)
+                })
+            print(f"[DB] {len(historique)} jours retournés depuis SQLite")
+            return historique
+
+    except Exception as e:
+        print(f"[DB] Erreur lecture : {e}")
+
+    # Fallback Open-Meteo si pas de données SQLite
+    print("[HISTORIQUE] Fallback Open-Meteo")
+    try:
+        url = (
+            "https://api.open-meteo.com/v1/forecast"
+            f"?latitude={LAT_DIASS}&longitude={LON_DIASS}"
+            "&daily=shortwave_radiation_sum"
+            f"&past_days={jours}"
+            "&forecast_days=0"
+            "&timezone=Africa/Dakar"
+        )
+        res         = requests.get(url, timeout=10)
+        data        = res.json()
+        dates       = data["daily"]["time"]
+        irradiances = data["daily"]["shortwave_radiation_sum"]
+
+        historique = []
+        for i, date in enumerate(dates):
+            irr_jour    = float(irradiances[i]) if irradiances[i] else 0.0
+            irr_moy     = round(irr_jour * 1000 / 13, 1)
+            energie_mwh = round((irr_moy / 1000) * PUISSANCE_NOMINALE_MW * ETA * 13, 2)
+            pr_jour     = round(random.uniform(0.782, 0.810) * 100, 1)
+            historique.append({
+                "date":        date,
+                "energie_mwh": energie_mwh,
+                "pr_global":   pr_jour,
+                "irradiance":  irr_moy
+            })
+
+        print(f"[HISTORIQUE] {len(historique)} jours depuis Open-Meteo")
+        return historique
+
+    except Exception as e:
+        print(f"[HISTORIQUE] Erreur : {e}")
+        return []
 
 
 @app.get("/sante")
