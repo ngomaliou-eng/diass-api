@@ -3,7 +3,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
-import random, math, jwt, requests, os, sqlite3
+import random, math, jwt, requests, os
+import psycopg2
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -16,15 +17,15 @@ load_dotenv()
 # ─────────────────────────────────────────────
 # BASE DE DONNÉES SQLite — Historique
 # ─────────────────────────────────────────────
-DB_PATH = "diass_historique.db"
+DATABASE_URL = os.getenv("DATABASE_URL", "")
 
 def init_db():
     """Crée la table historique si elle n'existe pas."""
-    conn = sqlite3.connect(DB_PATH)
+    conn = psycopg2.connect(DATABASE_URL)
     cur  = conn.cursor()
     cur.execute("""
         CREATE TABLE IF NOT EXISTS historique (
-            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            id           SERIAL PRIMARY KEY,
             date         TEXT NOT NULL,
             heure        TEXT NOT NULL,
             puissance_mw REAL,
@@ -258,9 +259,7 @@ def get_donnees_modbus():
 # ─────────────────────────────────────────────
 def calculer_puissance_onduleur(inv_id, irradiance):
     pnom = PUISSANCES_NOMINALES.get(inv_id, 699.84)
-    # Rendement aléatoire entre PR min et PR max — Source J492
-    eta_onduleur = random.uniform(0.782, 0.810)
-    return round((irradiance / 1000) * pnom * eta_onduleur, 1)
+    return round((irradiance / 1000) * pnom * ETA, 1)
 
 
 # ─────────────────────────────────────────────
@@ -375,7 +374,7 @@ def get_donnees():
 # ─────────────────────────────────────────────
 def sauvegarder_donnees(puissance, energie, pr, irradiance):
     """
-    Sauvegarde les données dans SQLite toutes les heures.
+    Sauvegarde les données dans PostgreSQL.
     Utilisé pour construire l'historique réel de la centrale.
     """
     try:
@@ -383,12 +382,17 @@ def sauvegarder_donnees(puissance, energie, pr, irradiance):
         date  = now.strftime("%Y-%m-%d")
         heure = now.strftime("%H:00")
 
-        conn = sqlite3.connect(DB_PATH)
+        conn = psycopg2.connect(DATABASE_URL)
         cur  = conn.cursor()
         cur.execute("""
-            INSERT OR REPLACE INTO historique
+            INSERT INTO historique
             (date, heure, puissance_mw, energie_mwh, pr_global, irradiance)
-            VALUES (?, ?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            ON CONFLICT (date, heure) DO UPDATE SET
+                puissance_mw = EXCLUDED.puissance_mw,
+                energie_mwh  = EXCLUDED.energie_mwh,
+                pr_global    = EXCLUDED.pr_global,
+                irradiance   = EXCLUDED.irradiance
         """, (date, heure, puissance, energie, pr, irradiance))
         conn.commit()
         conn.close()
@@ -609,12 +613,12 @@ def get_par_ptr(u=Depends(verifier_token)):
 @app.get("/donnees/historique")
 def get_historique(jours: int = 7, u=Depends(verifier_token)):
     """
-    Retourne l'historique depuis SQLite.
+    Retourne l'historique depuis PostgreSQL.
     Fallback vers Open-Meteo si pas de données en base.
     """
     jours = min(max(jours, 1), 30)
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = psycopg2.connect(DATABASE_URL)
         cur  = conn.cursor()
         cur.execute("""
             SELECT
@@ -623,10 +627,10 @@ def get_historique(jours: int = 7, u=Depends(verifier_token)):
                 AVG(pr_global)    as pr_global,
                 AVG(irradiance)   as irradiance
             FROM historique
-            WHERE date >= date('now', ?)
+            WHERE date >= CURRENT_DATE - INTERVAL %s
             GROUP BY date
             ORDER BY date ASC
-        """, (f"-{jours} days",))
+        """, (f"{jours} days",))
         rows = cur.fetchall()
         conn.close()
 
@@ -635,11 +639,11 @@ def get_historique(jours: int = 7, u=Depends(verifier_token)):
             for row in rows:
                 historique.append({
                     "date":        row[0],
-                    "energie_mwh": round(row[1] or 0, 2),
-                    "pr_global":   round(row[2] or 0, 1),
-                    "irradiance":  round(row[3] or 0, 1)
+                    "energie_mwh": round(float(row[1] or 0), 2),
+                    "pr_global":   round(float(row[2] or 0), 1),
+                    "irradiance":  round(float(row[3] or 0), 1)
                 })
-            print(f"[DB] {len(historique)} jours retournés depuis SQLite")
+            print(f"[DB] {len(historique)} jours retournés depuis PostgreSQL")
             return historique
 
     except Exception as e:
