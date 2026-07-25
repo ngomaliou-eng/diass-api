@@ -20,26 +20,50 @@ load_dotenv()
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 
 def init_db():
-    """Crée la table historique si elle n'existe pas."""
-    conn = psycopg2.connect(DATABASE_URL)
-    cur  = conn.cursor()
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS historique (
-            id           SERIAL PRIMARY KEY,
-            date         TEXT NOT NULL,
-            heure        TEXT NOT NULL,
-            puissance_mw REAL,
-            energie_mwh  REAL,
-            pr_global    REAL,
-            irradiance   REAL,
-            UNIQUE(date, heure)
-        )
-    """)
-    conn.commit()
-    conn.close()
-    print("[DB] Base de données initialisée")
-
-init_db()
+    try:
+        conn = get_conn()
+        cur  = conn.cursor()
+        
+        # Table historique existante
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS historique (
+                id           SERIAL PRIMARY KEY,
+                date         TEXT NOT NULL,
+                heure        TEXT NOT NULL,
+                puissance_mw REAL,
+                energie_mwh  REAL,
+                pr_global    REAL,
+                irradiance   REAL,
+                UNIQUE(date, heure)
+            )
+        """)
+        
+        # Nouvelle table maintenance
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS maintenance (
+                id                  SERIAL PRIMARY KEY,
+                ptr                 TEXT NOT NULL UNIQUE,
+                derniere_maintenance DATE,
+                prochaine_maintenance DATE,
+                statut              TEXT DEFAULT 'ok'
+            )
+        """)
+        
+        # Insérer les 8 PTR si pas encore présents
+        ptrs = ['PTR1','PTR2','PTR3','PTR4',
+                'PTR5','PTR6','PTR7','PTR8']
+        for ptr in ptrs:
+            cur.execute("""
+                INSERT INTO maintenance (ptr) 
+                VALUES (%s)
+                ON CONFLICT (ptr) DO NOTHING
+            """, (ptr,))
+        
+        conn.commit()
+        conn.close()
+        print("[DB] Base PostgreSQL initialisée")
+    except Exception as e:
+        print(f"[DB] Erreur init : {e}")
 
 # ─────────────────────────────────────────────
 # CONFIGURATION GÉNÉRALE
@@ -687,7 +711,86 @@ def get_historique(jours: int = 7, u=Depends(verifier_token)):
         print(f"[HISTORIQUE] Erreur : {e}")
         return []
 
+@app.get("/maintenance")
+def get_maintenance(u=Depends(verifier_token)):
+    """Retourne le planning de maintenance des PTR."""
+    try:
+        conn = get_conn()
+        cur  = conn.cursor()
+        cur.execute("""
+            SELECT ptr, derniere_maintenance, 
+                   prochaine_maintenance, statut
+            FROM maintenance
+            ORDER BY ptr
+        """)
+        rows = cur.fetchall()
+        conn.close()
+        
+        result = []
+        for row in rows:
+            # Calculer le statut automatiquement
+            prochaine = row[2]
+            if prochaine:
+                from datetime import date
+                today = date.today()
+                jours_restants = (prochaine - today).days
+                if jours_restants < 0:
+                    statut = "en_retard"
+                elif jours_restants <= 7:
+                    statut = "urgent"
+                else:
+                    statut = "ok"
+            else:
+                statut = "non_planifie"
+                
+            result.append({
+                "ptr":                  row[0],
+                "derniere_maintenance": str(row[1]) if row[1] else None,
+                "prochaine_maintenance": str(row[2]) if row[2] else None,
+                "statut":               statut
+            })
+        return result
+    except Exception as e:
+        print(f"[MAINTENANCE] Erreur : {e}")
+        return []
 
+
+@app.put("/maintenance/{ptr}")
+def update_maintenance(ptr: str, u=Depends(verifier_token)):
+    """
+    Enregistre une maintenance effectuée sur un PTR.
+    Met à jour la date de dernière maintenance 
+    et calcule la prochaine (dans 3 mois).
+    """
+    try:
+        from datetime import date
+        from dateutil.relativedelta import relativedelta
+        
+        today     = date.today()
+        prochaine = today + relativedelta(months=3)
+        
+        conn = get_conn()
+        cur  = conn.cursor()
+        cur.execute("""
+            UPDATE maintenance
+            SET derniere_maintenance  = %s,
+                prochaine_maintenance = %s,
+                statut                = 'ok'
+            WHERE ptr = %s
+        """, (today, prochaine, ptr))
+        conn.commit()
+        conn.close()
+        
+        print(f"[MAINTENANCE] {ptr} maintenu le {today}")
+        return {
+            "ptr":                  ptr,
+            "derniere_maintenance": str(today),
+            "prochaine_maintenance": str(prochaine),
+            "statut":               "ok"
+        }
+    except Exception as e:
+        print(f"[MAINTENANCE] Erreur : {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 @app.get("/sante")
 def sante():
     return {
