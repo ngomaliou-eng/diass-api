@@ -18,6 +18,9 @@ load_dotenv()
 # BASE DE DONNÉES SQLite — Historique
 # ─────────────────────────────────────────────
 DATABASE_URL = os.getenv("DATABASE_URL", "")
+def get_conn():
+    """Retourne une connexion PostgreSQL."""
+    return psycopg2.connect(DATABASE_URL)
 
 def init_db():
     """Crée la table historique si elle n'existe pas."""
