@@ -794,6 +794,38 @@ def update_maintenance(ptr: str, u=Depends(verifier_token)):
     except Exception as e:
         print(f"[MAINTENANCE] Erreur : {e}")
         raise HTTPException(status_code=500, detail=str(e))
+@app.get("/init-maintenance")
+def init_maintenance_route():
+    try:
+        conn = get_conn()
+        cur  = conn.cursor()
+        
+        # Créer la table si elle n'existe pas
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS maintenance (
+                id                   SERIAL PRIMARY KEY,
+                ptr                  TEXT NOT NULL UNIQUE,
+                derniere_maintenance  DATE,
+                prochaine_maintenance DATE,
+                statut               TEXT DEFAULT 'ok'
+            )
+        """)
+        
+        # Insérer les 8 PTR
+        ptrs = ['PTR1','PTR2','PTR3','PTR4',
+                'PTR5','PTR6','PTR7','PTR8']
+        for ptr in ptrs:
+            cur.execute("""
+                INSERT INTO maintenance (ptr) 
+                VALUES (%s)
+                ON CONFLICT (ptr) DO NOTHING
+            """, (ptr,))
+        
+        conn.commit()
+        conn.close()
+        return {"message": "8 PTR insérés avec succès"}
+    except Exception as e:
+        return {"erreur": str(e)}    
 @app.get("/sante")
 def sante():
     return {
