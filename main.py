@@ -262,7 +262,8 @@ def get_donnees_modbus():
 # ─────────────────────────────────────────────
 def calculer_puissance_onduleur(inv_id, irradiance):
     pnom = PUISSANCES_NOMINALES.get(inv_id, 699.84)
-    return round((irradiance / 1000) * pnom * ETA, 1)
+    eta_onduleur = random.uniform(0.782, 0.810)  # PR variable — Source J492
+    return round((irradiance / 1000) * pnom * eta_onduleur, 1)
 
 
 # ─────────────────────────────────────────────
