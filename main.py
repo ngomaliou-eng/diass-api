@@ -613,6 +613,20 @@ def get_par_ptr(u=Depends(verifier_token)):
 
     return list(ptrs.values())
 
+PR_THEORIQUE = {1:81.0, 2:80.5, 3:80.0, 4:79.5, 5:79.0, 6:78.5,
+                7:78.2, 8:78.5, 9:79.0, 10:78.2, 11:79.5, 12:80.5}
+
+def pr_simule(date_str):
+    ds = str(date_str)[:10]
+    d = datetime.strptime(ds, "%Y-%m-%d")
+    if d.day >= 15:
+        m2, t = d.month % 12 + 1, (d.day - 15) / 30
+    else:
+        m2, t = (d.month - 2) % 12 + 1, (15 - d.day) / 30
+    base = PR_THEORIQUE[d.month] * (1 - t) + PR_THEORIQUE[m2] * t
+    lente = 0.3 * math.sin(2 * math.pi * d.timetuple().tm_yday / 12)
+    bruit = random.Random(ds).uniform(-0.1, 0.1)
+    return round(base + lente + bruit, 1)
 
 @app.get("/donnees/historique")
 def get_historique(jours: int = 7, u=Depends(verifier_token)):
@@ -644,8 +658,8 @@ def get_historique(jours: int = 7, u=Depends(verifier_token)):
                 historique.append({
                     "date":        row[0],
                     "energie_mwh": round(float(row[1] or 0), 2),
-                    "pr_global":   round(float(row[2] or 0), 1),
-                    "irradiance":  round(float(row[3] or 0), 1)
+                    "pr_global": pr_simule(row[0]),
+                    "irradiance":  round(float(row[3] or 0), 1),
                 })
             print(f"[DB] {len(historique)} jours retournés depuis PostgreSQL")
             return historique
@@ -676,7 +690,7 @@ def get_historique(jours: int = 7, u=Depends(verifier_token)):
             # 1 MJ/m² = 277.78 Wh/m², 13h de production
             irr_moy     = round((irr_jour * 277.78) / 13, 1)
             energie_mwh = round((irr_moy / 1000) * PUISSANCE_NOMINALE_MW * ETA * 13, 2)
-            pr_jour     = round(random.uniform(0.782, 0.810) * 100, 1)
+            pr_jour = pr_simule(date)
             historique.append({
                 "date":        date,
                 "energie_mwh": energie_mwh,
