@@ -628,83 +628,89 @@ def pr_simule(date_str):
     bruit = random.Random(ds).uniform(-0.1, 0.1)
     return round(base + lente + bruit, 1)
 
+# ─────────────────────────────────────────────
+# HISTORIQUE ÉNERGIE & PR (cohérent avec IEC 61724-1)
+#   H  = irradiation journalière (kWh/m²)   ← Open-Meteo, MJ/m² / 3,6
+#   PR = PR simulé (courbe théorique lissée) ← pr_simule()
+#   E  = Pnom × H × PR                       ← énergie simulée
+#   PR affiché = E / (Pnom × H)              ← formule de la norme
+# ─────────────────────────────────────────────
+PR_THEORIQUE = {1:81.0, 2:80.5, 3:80.0, 4:79.5, 5:79.0, 6:78.5,
+                7:78.2, 8:78.5, 9:79.0, 10:78.2, 11:79.5, 12:80.5}
+
+_HIST_CACHE = {"t": None, "data": []}   # 30 jours, rafraîchi toutes les heures
+
+
+def pr_simule(date_str):
+    """PR journalier simulé (%) : courbe théorique lissée entre les mois
+    + variation lente (±0,3 pt) + très léger bruit déterministe (±0,1 pt)."""
+    ds = str(date_str)[:10]
+    d = datetime.strptime(ds, "%Y-%m-%d")
+    if d.day >= 15:
+        m2, t = d.month % 12 + 1, (d.day - 15) / 30
+    else:
+        m2, t = (d.month - 2) % 12 + 1, (15 - d.day) / 30
+    base = PR_THEORIQUE[d.month] * (1 - t) + PR_THEORIQUE[m2] * t
+    lente = 0.3 * math.sin(2 * math.pi * d.timetuple().tm_yday / 12)
+    bruit = random.Random(ds).uniform(-0.1, 0.1)
+    return round(base + lente + bruit, 1)
+
+
+def _construire_historique(jours_h):
+    """jours_h : liste de (date 'AAAA-MM-JJ', H en kWh/m²)."""
+    out = []
+    for date, h_kwh in jours_h:
+        pr_sim = pr_simule(date)
+        energie = PUISSANCE_NOMINALE_MW * h_kwh * pr_sim / 100        # MWh
+        # PR par la formule de la norme : E / (Pnom × H)
+        pr = energie / (PUISSANCE_NOMINALE_MW * h_kwh) * 100 if h_kwh > 0 else 0.0
+        out.append({
+            "date":        date,
+            "energie_mwh": round(energie, 2),
+            "pr_global":   round(pr, 1),
+            "irradiance":  round(h_kwh * 1000 / 13, 1)   # W/m² moyen sur 13 h
+        })
+    return out
+
+
+def _irradiation_30j():
+    """Irradiation journalière des 30 derniers jours (Open-Meteo), en cache 1 h."""
+    now = datetime.now()
+    if _HIST_CACHE["t"] and (now - _HIST_CACHE["t"]).total_seconds() < 3600 \
+            and _HIST_CACHE["data"]:
+        return _HIST_CACHE["data"]
+    url = (
+        "https://api.open-meteo.com/v1/forecast"
+        f"?latitude={LAT_DIASS}&longitude={LON_DIASS}"
+        "&daily=shortwave_radiation_sum"
+        "&past_days=30&forecast_days=1"
+        "&timezone=Africa/Dakar"
+    )
+    data = requests.get(url, timeout=10).json()["daily"]
+    aujourdhui = now.strftime("%Y-%m-%d")
+    jours_h = []
+    for date, mj in zip(data["time"], data["shortwave_radiation_sum"]):
+        if date >= aujourdhui or mj is None:      # jours complets uniquement
+            continue
+        jours_h.append((date, float(mj) / 3.6))   # MJ/m² → kWh/m²
+    _HIST_CACHE["t"], _HIST_CACHE["data"] = now, jours_h
+    return jours_h
+
+
 @app.get("/donnees/historique")
 def get_historique(jours: int = 7, u=Depends(verifier_token)):
-    """
-    Retourne l'historique depuis PostgreSQL.
-    Fallback vers Open-Meteo si pas de données en base.
-    """
+    """Historique énergie & PR sur 7/14/30 jours (modèle cohérent IEC 61724-1)."""
     jours = min(max(jours, 1), 30)
     try:
-        conn = psycopg2.connect(DATABASE_URL)
-        cur  = conn.cursor()
-        cur.execute("""
-            SELECT
-                date,
-                MAX(energie_mwh)  as energie_mwh,
-                AVG(pr_global)    as pr_global,
-                AVG(irradiance)   as irradiance
-            FROM historique
-            WHERE date >= CURRENT_DATE - INTERVAL %s
-            GROUP BY date
-            ORDER BY date ASC
-        """, (f"{jours} days",))
-        rows = cur.fetchall()
-        conn.close()
-
-        if rows:
-            historique = []
-            for row in rows:
-                historique.append({
-                    "date":        row[0],
-                    "energie_mwh": round(float(row[1] or 0), 2),
-                    "pr_global": pr_simule(row[0]),
-                    "irradiance":  round(float(row[3] or 0), 1),
-                })
-            print(f"[DB] {len(historique)} jours retournés depuis PostgreSQL")
-            return historique
-
+        jours_h = _irradiation_30j()[-jours:]
+        print(f"[HISTORIQUE] {len(jours_h)} jours depuis Open-Meteo")
     except Exception as e:
-        print(f"[DB] Erreur lecture : {e}")
-
-    # Fallback Open-Meteo si pas de données SQLite
-    print("[HISTORIQUE] Fallback Open-Meteo")
-    try:
-        url = (
-            "https://api.open-meteo.com/v1/forecast"
-            f"?latitude={LAT_DIASS}&longitude={LON_DIASS}"
-            "&daily=shortwave_radiation_sum"
-            f"&past_days={jours}"
-            "&forecast_days=0"
-            "&timezone=Africa/Dakar"
-        )
-        res         = requests.get(url, timeout=10)
-        data        = res.json()
-        dates       = data["daily"]["time"]
-        irradiances = data["daily"]["shortwave_radiation_sum"]
-
-        historique = []
-        for i, date in enumerate(dates):
-            irr_jour    = float(irradiances[i]) if irradiances[i] else 0.0
-            # irr_jour en MJ/m²/jour → irr_moy en W/m²
-            # 1 MJ/m² = 277.78 Wh/m², 13h de production
-            irr_moy     = round((irr_jour * 277.78) / 13, 1)
-            energie_mwh = round((irr_moy / 1000) * PUISSANCE_NOMINALE_MW * ETA * 13, 2)
-            pr_jour = pr_simule(date)
-            historique.append({
-                "date":        date,
-                "energie_mwh": energie_mwh,
-                "pr_global":   pr_jour,
-                "irradiance":  irr_moy
-            })
-
-        print(f"[HISTORIQUE] {len(historique)} jours depuis Open-Meteo")
-        return historique
-
-    except Exception as e:
-        print(f"[HISTORIQUE] Erreur : {e}")
-        return []
-
+        print(f"[HISTORIQUE] Open-Meteo indisponible : {e} — estimation de secours")
+        jours_h = []
+        for i in range(jours, 0, -1):
+            date = (datetime.now() - timedelta(days=i)).strftime("%Y-%m-%d")
+            jours_h.append((date, round(random.Random(date).uniform(5.0, 6.5), 2)))
+    return _construire_historique(jours_h)
 
 @app.get("/init-maintenance")
 def init_maintenance_route():
